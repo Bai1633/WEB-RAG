@@ -1,0 +1,131 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  # ==================== Backend Tests ====================
+  backend:
+    name: Backend - Lint, Test, Build
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: web_rag_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install dependencies
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio pytest-cov httpx ruff mypy
+
+      - name: Lint with ruff
+        working-directory: backend
+        run: ruff check app/ evals/
+
+      # Kept non-blocking for now: the codebase does not yet pass mypy --strict.
+      # Tighten this once the annotation debt is paid down.
+      - name: Type check with mypy
+        working-directory: backend
+        run: mypy app/ --ignore-missing-imports
+        continue-on-error: true
+
+      - name: Run migrations
+        working-directory: backend
+        env:
+          DB_HOST: localhost
+          DB_PORT: 5432
+          DB_USER: postgres
+          DB_PASSWORD: postgres
+          DB_NAME: web_rag_test
+        run: alembic upgrade head
+
+      - name: Run tests
+        working-directory: backend
+        env:
+          DB_HOST: localhost
+          DB_PORT: 5432
+          DB_USER: postgres
+          DB_PASSWORD: postgres
+          DB_NAME: web_rag_test
+          REDIS_URL: redis://localhost:6379/0
+          JWT_SECRET_KEY: test-secret-key-for-ci
+          LLM_API_KEY: test-key
+          EMBEDDING_API_KEY: test-key
+        # Hard gate: the unit suite must pass (no LLM/DB calls — provider and
+        # config tests read settings directly, so no provider env vars are set).
+        run: pytest tests/ -v --cov=app --cov-report=xml
+
+      - name: Build Docker image
+        working-directory: backend
+        run: docker build -t web-rag-backend:ci .
+
+  # ==================== Frontend Tests ====================
+  frontend:
+    name: Frontend - Lint, Type Check, Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Lint
+        working-directory: frontend
+        run: npm run lint
+
+      - name: Type check
+        working-directory: frontend
+        run: npx tsc --noEmit
+
+      - name: Build
+        working-directory: frontend
+        run: npm run build
+
+      - name: Build Docker image
+        working-directory: frontend
+        run: docker build -t web-rag-frontend:ci .

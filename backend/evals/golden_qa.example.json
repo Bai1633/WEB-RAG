@@ -1,0 +1,71 @@
+{
+  "description": "示例检索评测集：针对 evals/sample_docs 三篇文档。可直接运行：python -m evals.run_eval --cases evals/golden_qa.example.json --docs-dir evals/sample_docs",
+  "cases": [
+    {
+      "id": "pg-hnsw-params",
+      "question": "HNSW 索引的构建参数有哪些？",
+      "expected_sources": ["pgvector_index.md"],
+      "expected_keywords": ["m = 16", "ef_construction = 200"]
+    },
+    {
+      "id": "pg-index-types",
+      "question": "pgvector 支持哪几种近邻索引？",
+      "expected_sources": ["pgvector_index.md"],
+      "expected_keywords": ["HNSW", "IVFFlat"]
+    },
+    {
+      "id": "pipe-pdf-parser",
+      "question": "解析 PDF 文档使用的是什么库？",
+      "expected_sources": ["rag_pipeline.md"],
+      "expected_keywords": ["pdfplumber"]
+    },
+    {
+      "id": "pipe-chunk-size",
+      "question": "文档分块的块大小和重叠分别是多少？",
+      "expected_sources": ["rag_pipeline.md"],
+      "expected_keywords": ["512", "50"]
+    },
+    {
+      "id": "pipe-refusal-threshold",
+      "question": "系统在什么条件下会拒答？",
+      "expected_sources": ["rag_pipeline.md"],
+      "expected_keywords": ["0.35"]
+    },
+    {
+      "id": "ops-services",
+      "question": "生产环境一共启动哪几个容器服务？",
+      "expected_sources": ["ops_faq.md"],
+      "expected_keywords": ["nginx", "Celery"]
+    },
+    {
+      "id": "ops-followup-rewrite",
+      "comment": "多轮追问用例：验证查询改写。history 中先问向量索引，追问'它的构建参数'需要改写成独立问题才能召回 pgvector 文档",
+      "question": "它的构建参数是什么？",
+      "history": [
+        {"role": "user", "content": "本系统的向量索引用的是什么类型？"},
+        {"role": "assistant", "content": "系统默认使用 pgvector 的 HNSW 索引。"}
+      ],
+      "expected_sources": ["pgvector_index.md"],
+      "expected_keywords": ["m = 16"]
+    },
+    {
+      "id": "ops-followup-ports",
+      "comment": "多轮追问用例：'分别'指代上文提到的容器服务",
+      "question": "它们分别监听哪些端口？",
+      "history": [
+        {"role": "user", "content": "生产环境的统一入口用的是什么？"},
+        {"role": "assistant", "content": "生产环境通过 nginx 作为统一入口。"}
+      ],
+      "expected_sources": ["ops_faq.md"],
+      "expected_keywords": ["443"]
+    },
+    {
+      "id": "unanswerable-annual-party",
+      "comment": "拒答用例：知识库中无相关内容，期望检索分数低于拒答阈值",
+      "question": "公司年会定在哪一天举办？",
+      "expect_refusal": true,
+      "expected_sources": [],
+      "expected_keywords": []
+    }
+  ]
+}

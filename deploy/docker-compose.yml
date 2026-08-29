@@ -1,0 +1,165 @@
+services:
+  # ==================== PostgreSQL + pgvector ====================
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: web_rag_postgres
+    environment:
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+      POSTGRES_DB: ${DB_NAME:-web_rag}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ==================== Redis ====================
+  redis:
+    image: redis:7-alpine
+    container_name: web_rag_redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ==================== Backend API ====================
+  backend:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: web_rag_backend
+    environment:
+      - ENVIRONMENT=prod
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=${DB_USER:-postgres}
+      - DB_PASSWORD=${DB_PASSWORD:-postgres}
+      - DB_NAME=${DB_NAME:-web_rag}
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-change-me-in-production}
+      - LLM_PROVIDER=${LLM_PROVIDER:-openai}
+      - LLM_MODEL_NAME=${LLM_MODEL_NAME:-gpt-3.5-turbo}
+      - LLM_API_KEY=${LLM_API_KEY:-}
+      - LLM_BASE_URL=${LLM_BASE_URL:-https://api.openai.com/v1}
+      - EMBEDDING_PROVIDER=${EMBEDDING_PROVIDER:-openai}
+      - EMBEDDING_MODEL_NAME=${EMBEDDING_MODEL_NAME:-text-embedding-ada-002}
+      - EMBEDDING_API_KEY=${EMBEDDING_API_KEY:-}
+      - EMBEDDING_BASE_URL=${EMBEDDING_BASE_URL:-https://api.openai.com/v1}
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost}
+      - TRUST_PROXY_HEADERS=true  # nginx is the trusted proxy in this stack
+      - LOG_LEVEL=info
+    volumes:
+      - upload_data:/app/uploads
+    depends_on:
+      - postgres
+      - redis
+    expose:
+      - "8000"
+    restart: unless-stopped
+    command: >
+      sh -c "
+        echo 'Running migrations...' &&
+        alembic upgrade head &&
+        echo 'Starting server...' &&
+        gunicorn app.main:app 
+          --worker-class uvicorn.workers.UvicornWorker
+          --workers 4
+          --bind 0.0.0.0:8000
+          --timeout 120
+          --keep-alive 5
+          --log-level info
+      "
+
+  # ==================== Celery Worker ====================
+  worker:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: web_rag_worker
+    environment:
+      - ENVIRONMENT=prod
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=${DB_USER:-postgres}
+      - DB_PASSWORD=${DB_PASSWORD:-postgres}
+      - DB_NAME=${DB_NAME:-web_rag}
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+      - LLM_PROVIDER=${LLM_PROVIDER:-openai}
+      - LLM_MODEL_NAME=${LLM_MODEL_NAME:-gpt-3.5-turbo}
+      - LLM_API_KEY=${LLM_API_KEY:-}
+      - LLM_BASE_URL=${LLM_BASE_URL:-https://api.openai.com/v1}
+      - EMBEDDING_PROVIDER=${EMBEDDING_PROVIDER:-openai}
+      - EMBEDDING_MODEL_NAME=${EMBEDDING_MODEL_NAME:-text-embedding-ada-002}
+      - EMBEDDING_API_KEY=${EMBEDDING_API_KEY:-}
+      - EMBEDDING_BASE_URL=${EMBEDDING_BASE_URL:-https://api.openai.com/v1}
+      - LOG_LEVEL=info
+    volumes:
+      - upload_data:/app/uploads
+    depends_on:
+      - postgres
+      - redis
+    restart: unless-stopped
+    command: >
+      sh -c "
+        echo 'Starting Celery worker...' &&
+        celery -A app.workers.celery_app.celery_app worker 
+          --loglevel=info
+          --concurrency=4
+          -Q celery
+          --max-tasks-per-child=100
+      "
+
+  # ==================== Frontend ====================
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+      args:
+        - VITE_API_BASE_URL=/api
+    container_name: web_rag_frontend
+    depends_on:
+      - backend
+    expose:
+      - "80"
+    restart: unless-stopped
+
+  # ==================== Nginx ====================
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: web_rag_nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - backend
+      - frontend
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  postgres_data:
+  redis_data:
+  upload_data:
