@@ -172,7 +172,7 @@ class TestRewriteQuery:
         fake = _FakeLLM("pgvector 支持哪些索引类型？")
         engine = RAGEngine()
         with patch("app.core.rag_engine.get_llm_provider", return_value=fake):
-            result = asyncio.run(engine._rewrite_query("它支持哪些索引？", self._history()))
+            result = asyncio.run(engine.rewrite_query("它支持哪些索引？", self._history()))
         assert result == "pgvector 支持哪些索引类型？"
         # The rewrite prompt must include the history content
         sent = fake.calls[0]
@@ -185,7 +185,7 @@ class TestRewriteQuery:
         fake = _FakeLLM('"pgvector 的索引类型"\n多余的一行')
         engine = RAGEngine()
         with patch("app.core.rag_engine.get_llm_provider", return_value=fake):
-            result = asyncio.run(engine._rewrite_query("它有哪些索引？", self._history()))
+            result = asyncio.run(engine.rewrite_query("它有哪些索引？", self._history()))
         assert result == "pgvector 的索引类型"
 
     def test_falls_back_on_llm_error(self):
@@ -195,7 +195,7 @@ class TestRewriteQuery:
         fake = _FakeLLM(RuntimeError("api down"))
         engine = RAGEngine()
         with patch("app.core.rag_engine.get_llm_provider", return_value=fake):
-            result = asyncio.run(engine._rewrite_query("它有哪些索引？", self._history()))
+            result = asyncio.run(engine.rewrite_query("它有哪些索引？", self._history()))
         assert result == "它有哪些索引？"
 
     def test_falls_back_on_empty_output(self):
@@ -205,5 +205,5 @@ class TestRewriteQuery:
         fake = _FakeLLM("   ")
         engine = RAGEngine()
         with patch("app.core.rag_engine.get_llm_provider", return_value=fake):
-            result = asyncio.run(engine._rewrite_query("它有哪些索引？", self._history()))
+            result = asyncio.run(engine.rewrite_query("它有哪些索引？", self._history()))
         assert result == "它有哪些索引？"

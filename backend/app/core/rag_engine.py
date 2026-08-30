@@ -112,7 +112,7 @@ class RAGEngine:
         # a standalone query for retrieval/rerank, keep the original for generation.
         retrieve_query = question
         if history and settings.query_rewrite_enabled:
-            retrieve_query = await self._rewrite_query(question, history)
+            retrieve_query = await self.rewrite_query(question, history)
 
         reranked_chunks = await self.retrieve(db, kb_id, retrieve_query)
 
@@ -192,7 +192,7 @@ class RAGEngine:
         "4. 如果追问本身已是独立完整的问题，原样输出"
     )
 
-    async def _rewrite_query(
+    async def rewrite_query(
         self,
         question: str,
         history: list[dict[str, str]],

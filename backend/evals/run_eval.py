@@ -135,7 +135,7 @@ async def run_case(session, engine, case: dict, kb_id: uuid.UUID, top_k: int, us
 
     retrieve_query = question
     if history and use_rewrite:
-        retrieve_query = await engine._rewrite_query(question, history)
+        retrieve_query = await engine.rewrite_query(question, history)
 
     t0 = time.perf_counter()
     chunks = await engine.retrieve(session, kb_id, retrieve_query)

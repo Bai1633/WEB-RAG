@@ -44,6 +44,9 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 30
     refresh_token_expire_days: int = 7
+    # 登录失败锁定：窗口期内连续失败 N 次后锁定账号（Redis 计数，fail-open）
+    login_max_attempts: int = 5
+    login_lockout_window_seconds: int = 900
 
     # LLM
     llm_provider: str = "compatible"

@@ -176,12 +176,50 @@ class OllamaEmbeddingProvider(EmbeddingProvider):
         return self._dimension
 
 
+class MockEmbeddingProvider(EmbeddingProvider):
+    """Deterministic hash-based embeddings — no network, no model download.
+
+    Not a semantic embedding: similar texts score high only when they share
+    tokens/characters. Good enough to exercise the full pipeline (ingest ->
+    retrieve -> metrics) in tests and CI, and to smoke-run the eval harness.
+    Latin words are tokenized whole; CJK text is handled at character level
+    (which also gives usable bigram-ish overlap for Chinese queries).
+    """
+
+    def __init__(self, dim: int = 384) -> None:
+        if dim < 64:
+            raise ValueError("Mock embedding dimension must be >= 64")
+        self._mock_dim = dim
+
+    def get_embeddings(self, texts: list[str]) -> list[list[float]]:
+        return [self._embed_one(t) for t in texts]
+
+    def _embed_one(self, text: str) -> list[float]:
+        import hashlib
+        import math
+        import re
+
+        vec = [0.0] * self._mock_dim
+        tokens = re.findall(r"[a-zA-Z0-9]+|[\u4e00-\u9fff]", text.lower())
+        for token in tokens:
+            digest = int(hashlib.md5(token.encode("utf-8")).hexdigest(), 16)
+            vec[digest % self._mock_dim] += 1.0
+        norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+        return [v / norm for v in vec]
+
+    @property
+    def dimension(self) -> int:
+        return self._mock_dim
+
+
 @lru_cache(maxsize=1)
 def get_embedding_provider() -> EmbeddingProvider:
     """Get the configured embedding provider (singleton)."""
     provider = settings.embedding_provider.lower()
 
-    if provider == "openai":
+    if provider == "mock":
+        return MockEmbeddingProvider(dim=settings.embedding_dim)
+    elif provider == "openai":
         if not settings.embedding_api_key:
             logger.warning("OpenAI API key not set, embeddings may fail")
         return OpenAIEmbeddingProvider(

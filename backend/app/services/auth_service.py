@@ -17,6 +17,8 @@ from app.core.security import (
 )
 from app.db.models import RefreshToken, User
 from app.db.repositories.user_repo import UserRepository
+from app.utils.exceptions import AppException
+from app.utils.login_lockout import login_lockout
 
 settings = get_settings()
 
@@ -44,8 +46,21 @@ class AuthService:
         if not user or not user.is_active:
             raise ValueError("Invalid email or password")
 
+        # Brute-force protection: lock the account after too many failures.
+        # AppException(429) bypasses this route's ValueError->401 mapping and is
+        # rendered by the global exception handler.
+        if await login_lockout.is_locked(email):
+            raise AppException(
+                message="登录失败次数过多，账号已临时锁定，请稍后再试",
+                status_code=429,
+                code="login_locked",
+            )
+
         if not verify_password(password, user.hashed_password):
+            await login_lockout.record_failure(email)
             raise ValueError("Invalid email or password")
+
+        await login_lockout.reset(email)
 
         access_token = create_access_token(subject=user.id)
         refresh_token = create_refresh_token(subject=user.id)

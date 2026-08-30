@@ -21,6 +21,11 @@ python -m evals.run_eval --cases evals/golden_qa.example.json \
 
 # 3. 针对已有知识库评测（用例里的 expected_sources 要写该库中的文件名）
 python -m evals.run_eval --cases my_cases.json --kb-id <uuid> --json-out report.json
+
+# 4. 无 Embedding 端点时跑通全链路（确定性哈希向量，CI smoke 用；
+#    相似度只反映词面重叠，指标不代表真实语义质量）
+EMBEDDING_PROVIDER=mock EMBEDDING_DIM=384 \
+    python -m evals.run_eval --cases evals/golden_qa.example.json --docs-dir evals/sample_docs
 ```
 
 ## 用例格式（JSON）

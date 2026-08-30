@@ -152,11 +152,12 @@ class OllamaLLMProvider(LLMProvider):
 
     async def chat(self, messages: list[dict[str, str]], **kwargs: Any) -> tuple[str, int]:
         temperature = kwargs.get("temperature", self._temperature)
+        max_tokens = kwargs.get("max_tokens", self._max_tokens)
 
         response = await self._client.chat(
             model=self._model_name,
             messages=messages,
-            options={"temperature": temperature},
+            options={"temperature": temperature, "num_predict": max_tokens},
             stream=False,
         )
         text = response.get("message", {}).get("content", "")
@@ -167,11 +168,12 @@ class OllamaLLMProvider(LLMProvider):
         self, messages: list[dict[str, str]], **kwargs: Any
     ) -> AsyncGenerator[str, None]:
         temperature = kwargs.get("temperature", self._temperature)
+        max_tokens = kwargs.get("max_tokens", self._max_tokens)
 
         stream = await self._client.chat(
             model=self._model_name,
             messages=messages,
-            options={"temperature": temperature},
+            options={"temperature": temperature, "num_predict": max_tokens},
             stream=True,
         )
         async for chunk in stream:

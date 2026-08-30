@@ -90,6 +90,20 @@ jobs:
         # config tests read settings directly, so no provider env vars are set).
         run: pytest tests/ -v --cov=app --cov-report=xml
 
+      # End-to-end smoke of the eval harness: mock embeddings (no API needed),
+      # real Postgres. Proves ingest -> retrieve -> metrics -> cleanup works.
+      - name: Run retrieval eval smoke (mock embedding)
+        working-directory: backend
+        env:
+          DB_HOST: localhost
+          DB_PORT: 5432
+          DB_USER: postgres
+          DB_PASSWORD: postgres
+          DB_NAME: web_rag_test
+          EMBEDDING_PROVIDER: mock
+          EMBEDDING_DIM: "384"
+        run: python -m evals.run_eval --cases evals/golden_qa.example.json --docs-dir evals/sample_docs --top-k 5
+
       - name: Build Docker image
         working-directory: backend
         run: docker build -t web-rag-backend:ci .
@@ -117,6 +131,10 @@ jobs:
       - name: Lint
         working-directory: frontend
         run: npm run lint
+
+      - name: Unit tests
+        working-directory: frontend
+        run: npm test
 
       - name: Type check
         working-directory: frontend
