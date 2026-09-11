@@ -1,0 +1,57 @@
+# ============================================================
+# Docker build context exclusions for backend
+# Purpose: keep build context small and prevent secrets leaking
+#          into image layers.
+# ============================================================
+
+# --- Local model weights (multi-GB, not needed unless you bake them in) ---
+models/
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.onnx
+
+# --- Secrets / local config ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# --- Python artifacts ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Virtual environments ---
+venv/
+.venv/
+env/
+ENV/
+
+# --- Runtime data ---
+uploads/
+*.log
+logs/
+
+# --- Tooling / VCS / IDE ---
+.git/
+.gitignore
+.github/
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# --- Docs not needed at runtime ---
+*.md
+!README.md

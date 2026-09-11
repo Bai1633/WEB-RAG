@@ -31,10 +31,36 @@ ENV/
 *.swp
 *.swo
 
-# Env files
+# ===================================================================
+# Secrets & local environment  —  NEVER commit real credentials
+# The real backend/.env holds LLM/Embedding API keys, DB & JWT
+# secrets; it is ignored. Only *.example templates are committed
+# (they contain placeholders, no real keys).
+# ===================================================================
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
+
+# Private key / credential files
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+credentials.json
+service-account*.json
+*.secret
+
+# Local working docs (analysis / drafts / 复盘 — not for public repo)
+项目问题复盘_口述稿.md
+检索链路原理分析与修复.md
+文档加工层设计方案.md
+项目说明_简历版.md
+技术开发深度分析报告.md
+项目深度分析报告.md
+部署与启动手册.md
+部署上线指南.md
+重构提示词.md
 
 # Database
 *.db

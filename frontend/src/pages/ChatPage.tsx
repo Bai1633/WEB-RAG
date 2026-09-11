@@ -23,6 +23,17 @@ const ChatPage: React.FC = () => {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [isSending, setIsSending] = useState(false);
+  // 首个 token 到达前要等检索 +（首次）重排模型加载，几十秒很常见。
+  // 超过阈值就给用户一句明确说明，避免看起来像卡死。
+  const [slowHint, setSlowHint] = useState(false);
+  const slowHintTimerRef = useRef<number | null>(null);
+  const clearSlowHint = () => {
+    if (slowHintTimerRef.current) {
+      clearTimeout(slowHintTimerRef.current);
+      slowHintTimerRef.current = null;
+    }
+    setSlowHint(false);
+  };
   const [conversations, setConversations] = useState<ChatConversationSummary[]>([]);
   const [suggestions, setSuggestions] = useState<string[]>(DEFAULT_SUGGESTIONS);
   const abortRef = useRef<(() => void) | null>(null);
@@ -153,6 +164,11 @@ const ChatPage: React.FC = () => {
     }
     setIsSending(true);
 
+    // 8 秒内还没有任何内容就显示"仍在检索"提示，收到第一个事件即取消
+    if (slowHintTimerRef.current) clearTimeout(slowHintTimerRef.current);
+    setSlowHint(false);
+    slowHintTimerRef.current = window.setTimeout(() => setSlowHint(true), 8000);
+
     // Build history from recent messages for multi-turn context
     const recentHistory = messages
       .filter((m) => !m.isStreaming)
@@ -165,6 +181,7 @@ const ChatPage: React.FC = () => {
       userMessage.content,
       {
         onSources: (sources: ChatSource[]) => {
+          clearSlowHint();
           setMessages((prev) =>
             prev.map((m) =>
               m.id === assistantMessage.id ? { ...m, sources } : m
@@ -172,6 +189,7 @@ const ChatPage: React.FC = () => {
           );
         },
       onContent: (chunk: string) => {
+        clearSlowHint();
         setMessages((prev) =>
           prev.map((m) =>
             m.id === assistantMessage.id
@@ -181,6 +199,7 @@ const ChatPage: React.FC = () => {
         );
       },
       onDone: (metadata: any) => {
+        clearSlowHint();
         setMessages((prev) =>
           prev.map((m) =>
             m.id === assistantMessage.id
@@ -201,6 +220,7 @@ const ChatPage: React.FC = () => {
         if (kbId) void loadConversations(kbId);
       },
       onError: (error: string) => {
+        clearSlowHint();
         setMessages((prev) =>
           prev.map((m) =>
             m.id === assistantMessage.id
@@ -352,6 +372,11 @@ const ChatPage: React.FC = () => {
           )}
           {isSending && messages.length > 0 && messages[messages.length - 1].role === 'user' && (
             <TypingIndicator />
+          )}
+          {slowHint && isSending && (
+            <div className="text-xs text-gray-500 dark:text-gray-400 px-1 py-2">
+              正在检索知识库并生成回答；首次提问需要加载重排模型，可能需要 1 分钟左右，请稍候…
+            </div>
           )}
           <div ref={messagesEndRef} />
         </div>

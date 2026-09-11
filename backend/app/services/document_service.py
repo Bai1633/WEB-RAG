@@ -85,6 +85,14 @@ class DocumentService:
         # Update status to queued
         doc = await self.doc_repo.update_status(doc.id, DocumentStatus.QUEUED)
 
+        # Commit BEFORE enqueueing. The worker uses its own DB connection under
+        # READ COMMITTED and can pick the task up within milliseconds; if the
+        # row is still inside an uncommitted transaction, the worker's lookup
+        # returns None and the document is stranded in `queued` forever.
+        # Safe to commit here: the session is created with expire_on_commit=False,
+        # so `doc` stays usable for the task_id update below.
+        await self.db.commit()
+
         # Enqueue Celery task
         task = celery_app.send_task(
             "app.workers.tasks.process_document",
@@ -170,6 +178,9 @@ class DocumentService:
             progress=0,
             chunk_count=0,
         )
+
+        # Commit BEFORE enqueueing (same READ COMMITTED race as upload_document)
+        await self.db.commit()
 
         # Enqueue new task
         task = celery_app.send_task(

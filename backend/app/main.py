@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from contextlib import asynccontextmanager
 from typing import Any
@@ -93,15 +94,47 @@ async def lifespan(app: FastAPI) -> Any:
     os.makedirs(settings.upload_dir, exist_ok=True)
     logger.info("upload_dir_ready", path=settings.upload_dir)
 
-    # Warm up embedding provider if local (avoid first-request latency)
-    if settings.embedding_provider in ("huggingface", "hf", "local"):
+    # Warm up the heavy providers in the BACKGROUND so the first real request is
+    # not the one paying for them:
+    #   * embedding: first call pays client init + TLS handshake (~20s observed
+    #     against DashScope, even though later calls are sub-second).
+    #   * reranker:  lazily loads a 2.3GB cross-encoder (~50s on CPU).
+    # Without this the very first question looks like a hang: nothing is yielded
+    # to the SSE stream until retrieval finishes, so the UI spins silently.
+    # Each step is bounded by wait_for, so a slow or broken provider can never
+    # block startup — it just logs a warning.
+    async def _warmup_providers() -> None:
+        loop = asyncio.get_running_loop()
+
         try:
             from app.core.embedding import get_embedding_provider
 
-            get_embedding_provider()
-            logger.info("embedding_provider_warmed_up")
+            await asyncio.wait_for(
+                loop.run_in_executor(
+                    None, lambda: get_embedding_provider().get_embeddings(["warmup"])
+                ),
+                timeout=60,
+            )
+            logger.info("embedding_warmed_up")
         except Exception as e:
             logger.warning("embedding_warmup_failed", error=str(e))
+
+        if settings.rerank_enabled:
+            try:
+                from app.core.reranker import rerank
+
+                await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None,
+                        lambda: rerank("warmup", [{"text": "warmup", "score": 0.0}]),
+                    ),
+                    timeout=180,
+                )
+                logger.info("reranker_warmed_up")
+            except Exception as e:
+                logger.warning("reranker_warmup_failed", error=str(e))
+
+    asyncio.create_task(_warmup_providers())
 
     logger.info(
         "server_started",

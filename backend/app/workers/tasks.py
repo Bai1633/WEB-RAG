@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import uuid
 from uuid import UUID
@@ -86,8 +87,13 @@ def process_document(self, doc_id_str: str, kb_id_str: str) -> dict:
     # ===== Idempotency check =====
     doc = session.get(Document, doc_id)
     if not doc:
-        logger.error(f"Document {doc_id} not found")
-        return {"error": "Document not found"}
+        # The API commits before enqueueing, but retries/edge cases can still
+        # land here while the row is invisible to this connection
+        # (READ COMMITTED). Retry with backoff instead of returning an error:
+        # returning made Celery mark the task as *succeeded*, so autoretry never
+        # fired and the document stayed in `queued` with no self-healing path.
+        logger.warning(f"Document {doc_id} not visible yet, scheduling retry")
+        raise self.retry(countdown=2, max_retries=3)
 
     # If already completed, skip
     if doc.status == DocumentStatus.COMPLETED:
@@ -239,9 +245,17 @@ def process_document(self, doc_id_str: str, kb_id_str: str) -> dict:
     acks_late=True,
 )
 def cleanup_stuck_documents(self) -> dict:
-    """Periodic task: find documents stuck in 'processing' and retry them.
+    """Periodic task: re-queue documents that never reached a terminal state.
 
-    This implements the 'crash self-healing' feature.
+    Two distinct failure modes are covered:
+
+    1. Stuck in ``processing`` — the worker was killed mid-task (crash, OOM,
+       deploy). Covered by ``document_processing_timeout``.
+    2. Stuck in ``queued`` — the task was lost *before* any worker picked it up
+       (broker restart, dropped message, or the historical "enqueue before
+       commit" race). Nothing else in the system ever looks at a ``queued``
+       document, so without this branch it would stay there forever.
+       Covered by ``document_queued_timeout``.
     """
     import datetime
 
@@ -250,34 +264,73 @@ def cleanup_stuck_documents(self) -> dict:
 
     session = self._db_session
     settings = get_settings()
-    timeout_seconds = settings.document_processing_timeout
-    cutoff = datetime.datetime.now(datetime.UTC) - datetime.timedelta(seconds=timeout_seconds)
+    now = datetime.datetime.now(datetime.UTC)
 
-    stuck_docs = (
+    # 1) processing too long -> mark failed, then requeue
+    processing_cutoff = now - datetime.timedelta(seconds=settings.document_processing_timeout)
+    stuck_processing = (
         session.query(Document)
         .filter(
             Document.status == DocumentStatus.PROCESSING,
-            Document.updated_at < cutoff,
+            Document.updated_at < processing_cutoff,
         )
         .all()
     )
+    for doc in stuck_processing:
+        logger.warning(f"Found document stuck in processing: {doc.id}, requeuing")
+        doc.status = DocumentStatus.FAILED
+        doc.error = (
+            f"Processing timed out after {settings.document_processing_timeout}s, auto-requeuing"
+        )
+
+    # 2) queued too long -> the task never ran, requeue as-is
+    queued_cutoff = now - datetime.timedelta(seconds=settings.document_queued_timeout)
+    stuck_queued = (
+        session.query(Document)
+        .filter(
+            Document.status == DocumentStatus.QUEUED,
+            Document.updated_at < queued_cutoff,
+        )
+        .all()
+    )
+    for doc in stuck_queued:
+        logger.warning(
+            f"Found document stuck in queued for {settings.document_queued_timeout}s: "
+            f"{doc.id}, requeuing"
+        )
+        doc.error = f"Still queued after {settings.document_queued_timeout}s, auto-requeuing"
+
+    stale_docs = stuck_processing + stuck_queued
+
+    # Cancel the previous task before dispatching a new one, so a late-running
+    # duplicate cannot race the replacement. terminate=False: never kill a task
+    # that is genuinely still working on the document.
+    for doc in stale_docs:
+        if doc.task_id:
+            with contextlib.suppress(Exception):
+                celery_app.control.revoke(doc.task_id, terminate=False)
+
+    # Commit BEFORE enqueueing — same READ COMMITTED race as document_service:
+    # the target task looks the document up on its own connection.
+    session.commit()
 
     recovered = 0
-    for doc in stuck_docs:
-        logger.info(f"Found stuck document: {doc.id}, requeuing")
-        doc.status = DocumentStatus.FAILED
-        doc.error = f"Processing timed out after {timeout_seconds}s, auto-requeuing"
-        session.flush()
-
-        # Requeue
-        celery_app.send_task(
+    for doc in stale_docs:
+        task = celery_app.send_task(
             "app.workers.tasks.process_document",
             args=[str(doc.id), str(doc.kb_id)],
         )
+        doc.task_id = task.id
         recovered += 1
 
-    session.commit()
-    return {"stuck_found": len(stuck_docs), "recovered": recovered}
+    if stale_docs:
+        session.commit()
+
+    return {
+        "stuck_processing": len(stuck_processing),
+        "stuck_queued": len(stuck_queued),
+        "recovered": recovered,
+    }
 
 
 @celery_app.task(

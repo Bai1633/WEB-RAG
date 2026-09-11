@@ -31,6 +31,44 @@ let failedQueue: Array<{
   reject: (reason?: any) => void;
 }> = [];
 
+// Backend validation messages that deserve a Chinese wording in the UI.
+const VALIDATION_MESSAGE_MAP: Record<string, string> = {
+  'Password must contain at least one lowercase letter': '密码需包含至少一个小写字母',
+  'Password must contain at least one uppercase letter': '密码需包含至少一个大写字母',
+  'Password must contain at least one digit': '密码需包含至少一个数字',
+};
+
+/**
+ * FastAPI returns HTTP 422 with `detail` as an ARRAY of validation errors:
+ *   { detail: [{ loc: [...], msg: "Value error, Password must ...", ... }] }
+ *
+ * Callers (authStore etc.) read `error.response.data.detail` as a plain string,
+ * so an array either renders as nothing or throws "Objects are not valid as a
+ * React child". Normalize it into one readable line before it reaches any UI.
+ */
+const normalizeValidationDetail = (detail: unknown): string => {
+  if (typeof detail === 'string') {
+    return detail;
+  }
+
+  if (Array.isArray(detail)) {
+    return detail
+      .map((item: any) => {
+        const raw = typeof item === 'string' ? item : item?.msg ?? '';
+        const cleaned = String(raw).replace(/^Value error,\s*/, '');
+        return VALIDATION_MESSAGE_MAP[cleaned] ?? cleaned;
+      })
+      .filter(Boolean)
+      .join('；');
+  }
+
+  if (detail && typeof detail === 'object') {
+    return String((detail as any).msg ?? '');
+  }
+
+  return String(detail ?? '');
+};
+
 const processQueue = (error: any, token: string | null = null) => {
   failedQueue.forEach((prom) => {
     if (error) {
@@ -45,6 +83,12 @@ const processQueue = (error: any, token: string | null = null) => {
 apiClient.interceptors.response.use(
   (response) => response,
   async (error) => {
+    // Normalize 422 `detail` arrays so callers always receive a string.
+    const data = error.response?.data;
+    if (data && typeof data === 'object' && Array.isArray(data.detail)) {
+      data.detail = normalizeValidationDetail(data.detail);
+    }
+
     const originalRequest = error.config;
 
     if (error.response?.status === 401 && !originalRequest._retry) {

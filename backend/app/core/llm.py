@@ -71,6 +71,8 @@ class OpenAILLMProvider(LLMProvider):
         base_url: str | None = None,
         temperature: float = 0.1,
         max_tokens: int = 2048,
+        timeout: float = 30.0,
+        max_retries: int = 1,
     ) -> None:
         from openai import AsyncOpenAI
 
@@ -80,6 +82,8 @@ class OpenAILLMProvider(LLMProvider):
         self._client = AsyncOpenAI(
             api_key=api_key,
             base_url=base_url,
+            timeout=timeout,
+            max_retries=max_retries,
         )
 
     async def chat(self, messages: list[dict[str, str]], **kwargs: Any) -> tuple[str, int]:
@@ -215,6 +219,8 @@ def get_llm_provider() -> LLMProvider:
             base_url=settings.llm_base_url,
             temperature=settings.llm_temperature,
             max_tokens=settings.llm_max_tokens,
+            timeout=settings.llm_timeout,
+            max_retries=settings.llm_max_retries,
         )
     elif provider == "ollama":
         return OllamaLLMProvider(

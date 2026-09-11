@@ -6,7 +6,12 @@ import time
 
 import structlog
 
-from app.utils.redis_client import get_redis
+from app.utils.redis_client import (
+    get_redis,
+    is_redis_available,
+    mark_redis_available,
+    mark_redis_unavailable,
+)
 
 logger = structlog.get_logger()
 
@@ -44,6 +49,11 @@ class RateLimiter:
         Returns:
             True if allowed, False if rate limited.
         """
+        # Circuit breaker: while Redis is known to be down, skip it entirely
+        # instead of paying the connection timeout on every single request.
+        if not is_redis_available():
+            return True
+
         redis = get_redis()
         redis_key = f"{self.prefix}:{key}"
 
@@ -93,9 +103,13 @@ class RateLimiter:
                 str(tokens_needed),
                 str(now),
             )
+            mark_redis_available()
             return bool(result)
         except Exception as e:
             logger.warning("rate_limit_redis_error", error=str(e), key=key)
+            # Open the breaker: skip Redis for the cooldown window so the next
+            # requests fail open immediately instead of waiting for a timeout.
+            mark_redis_unavailable()
             # Fail open - allow request if Redis is down
             return True
 

@@ -27,7 +27,10 @@ class Settings(BaseSettings):
     log_level: str = "info"
 
     # Database - individual components (URL built from these)
-    db_host: str = "localhost"
+    # Use 127.0.0.1 rather than "localhost": on Windows, "localhost" resolves
+    # to IPv6 (::1) first and Docker Desktop does not forward the loopback
+    # IPv6 port, causing multi-second connection timeouts (e.g. Redis).
+    db_host: str = "127.0.0.1"
     db_port: int = 5432
     db_user: str = "postgres"
     db_password: str = "postgres"
@@ -36,7 +39,7 @@ class Settings(BaseSettings):
     db_max_overflow: int = 10
 
     # Redis
-    redis_url: str = "redis://localhost:6379/0"
+    redis_url: str = "redis://127.0.0.1:6379/0"
     redis_pool_size: int = 50
 
     # JWT Auth
@@ -55,6 +58,10 @@ class Settings(BaseSettings):
     llm_base_url: str = "https://api.openai.com/v1"
     llm_temperature: float = 0.1
     llm_max_tokens: int = 2048
+    # 单次 LLM 请求超时（秒）。openai 客户端默认 600s × 2 次重试 —— 云端一卡，
+    # 用户就要干等半小时且看不到任何错误。这里收紧成快速失败。
+    llm_timeout: float = 30.0
+    llm_max_retries: int = 1
 
     # Embedding
     embedding_provider: str = "openai"
@@ -78,8 +85,13 @@ class Settings(BaseSettings):
     rrf_k: int = 60
     # 融合后保留的 topN（通常与 similarity_top_k 一致或略大）
     rrf_top_k: int = 10
-    # trigram 相似度下限，低于该值的 chunk 视为无关（也用于走 GIN 索引加速）
-    trgm_similarity_threshold: float = 0.1
+    # 词法通道相似度下限，低于该值的 chunk 视为无关（也用于走 GIN 索引加速）。
+    # 注意：这里对应的是 word_similarity(query, text)，分母是 query 的 trigram 数，
+    # 与 similarity(query, text)（分母是并集）量级完全不同：
+    #   - 关键词完整出现时 word_similarity ≈ 1.0
+    #   - 仅蹭到 1~2 个 trigram 的噪声行约 0.2
+    # 故阈值取 0.45：滤掉噪声又不误杀部分匹配。
+    trgm_similarity_threshold: float = 0.45
     # 各检索通道在 RRF 融合中的权重（可按数据分布调优）
     vector_weight: float = 1.0
     lexical_weight: float = 1.0
@@ -92,6 +104,15 @@ class Settings(BaseSettings):
     rerank_model_path: str = "./models/bge-reranker-v2-m3"
     # 重排开关：true=启用 BGE 重排；false=仅按相似度排序（省内存/无需 GPU）。
     rerank_enabled: bool = True
+    # 是否用"绝对分数阈值"做拒答门控。
+    # 默认关闭，原因（2026-09-10 实测）：
+    #   1) 关闭重排时，_rrf_fuse 会对 RRF 分数做 max 归一化，top1 恒等于 1.0，
+    #      阈值形同虚设（永远通过）；
+    #   2) 开启重排时，score 被换成 BGE 的 sigmoid 相关度（0~1 绝对值），
+    #      对"总结/归纳"这类元问题天然只有 0.002~0.005，用 0.35 去卡必然误杀。
+    # 真正可靠的拒答信号是"召回为空"（not chunks），由 rag_engine 直接判断。
+    # 需要更保守的行为时再打开本开关并调 confidence_threshold。
+    confidence_gate_enabled: bool = False
     confidence_threshold: float = 0.35
     # 注入 LLM 的上下文最大 token 数（防止超长上下文超出模型窗口或稀释注意力）
     context_max_tokens: int = 3000
@@ -107,6 +128,11 @@ class Settings(BaseSettings):
     query_rewrite_enabled: bool = True
     # 文档处理超时（秒），超时后 cleanup_stuck_documents 会重新入队
     document_processing_timeout: int = 3600
+    # 文档停留在 queued 的超时（秒）：任务在 worker 认领前就丢了
+    # （broker 重启、消息丢失、或曾经的先派发后提交竞态）时，文档会永远卡在
+    # queued —— 没有任何其它逻辑会看它。超时后同样由 cleanup_stuck_documents 重排。
+    # 取值要大于 beat 周期（600s），给正常排队的大文件留足时间，避免误伤。
+    document_queued_timeout: int = 900
 
     # Upload
     upload_dir: str = "./uploads"
@@ -126,8 +152,8 @@ class Settings(BaseSettings):
     trust_proxy_headers: bool = False
 
     # Celery
-    celery_broker_url: str = "redis://localhost:6379/1"
-    celery_result_backend: str = "redis://localhost:6379/2"
+    celery_broker_url: str = "redis://127.0.0.1:6379/1"
+    celery_result_backend: str = "redis://127.0.0.1:6379/2"
     celery_worker_concurrency: int = 4
     celery_task_soft_time_limit: int = 3600
     celery_task_time_limit: int = 3900

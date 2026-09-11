@@ -45,6 +45,11 @@ class RetrievedChunk:
     source: str = ""
     # Which retrieval channels matched this chunk: {"vector","lexical","fulltext"}
     channels: list[str] = field(default_factory=list)
+    # 未归一化的 RRF 融合原始分。score 会被 max 归一化（top1 恒为 1.0）或被重排
+    # sigmoid 覆盖，都会丢失"绝对相关度"信息；下游若要判断"召回质量如何"应看这个值。
+    fused_score: float = 0.0
+    # 重排模型给出的原始 logit（未过 sigmoid），仅在重排生效时填充。
+    reranker_logit: float | None = None
 
 
 @dataclass
@@ -121,7 +126,19 @@ class RAGEngine:
             "根据知识库中的信息，我无法回答这个问题。请尝试换一种提问方式，"
             "或者确认相关文档是否已上传到知识库。"
         )
-        if not reranked_chunks or reranked_chunks[0].score < settings.confidence_threshold:
+        # 拒答判据（2026-09-10 修订）
+        # 主判据 = 召回为空：这是唯一语义明确、且不受分数口径影响的信号。
+        # 绝对阈值仅在 confidence_gate_enabled=True 时额外启用，默认关闭 —— 因为
+        # score 在两条路径下都不适合做绝对判断（详见 config.py 里的注释）：
+        #   关重排 → _rrf_fuse 做了 max 归一化，top1 恒为 1.0，阈值形同虚设；
+        #   开重排 → score 是 BGE sigmoid 绝对值，"总结/归纳"类元问题天然只有
+        #            0.002~0.005，用 0.35 去卡必然把正常提问误杀成拒答。
+        below_threshold = bool(
+            settings.confidence_gate_enabled
+            and reranked_chunks
+            and reranked_chunks[0].score < settings.confidence_threshold
+        )
+        if not reranked_chunks or below_threshold:
             if stream:
                 # 流式请求必须始终返回异步生成器，否则 ChatService._chat_stream 的
                 # `async for chunk in stream_gen` 会因拿到 RAGResponse 而失败
@@ -135,7 +152,11 @@ class RAGEngine:
                 tokens_used=0,
                 latency_ms=latency_ms,
                 refused=True,
-                refusal_reason="below_confidence_threshold",
+                refusal_reason=(
+                    "no_results"
+                    if not reranked_chunks
+                    else "below_confidence_threshold"
+                ),
             )
 
         top_confidence = reranked_chunks[0].score
@@ -308,6 +329,22 @@ class RAGEngine:
     ) -> list[RetrievedChunk]:
         """Retrieve chunks by trigram word-match similarity (pg_trgm).
 
+        Uses ``word_similarity(query, text)`` rather than ``similarity(query, text)``.
+        两者分母不同，量级差一个数量级以上（2026-09-10 实测）：
+
+        - ``similarity(a, b) = |A∩B| / |A∪B|``：分母是 trigram 并集。短 query × 长
+          chunk 时分母被 chunk 撑大，分数必然趋 0 —— 实测"剧本大纲"对命中段落只有
+          **0.0118**，任何合理阈值都过不了，词法通道等于废的。
+        - ``word_similarity(a, b)``：分母是 query 的 trigram 数，衡量"query 的
+          trigram 在 text 中连续区间的最大覆盖率"。同一个例子实测 **1.0000**。
+
+        行为上这恰好是混合检索想要的：关键词/实体型 query 能命中词法通道，
+        自然语言长问句因无字面重叠而不命中，交给向量通道兜底。
+
+        注意：函数写法无法命中 ``gin_trgm_ops`` 索引（索引只服务 ``<%``/``%>`` 算子），
+        当前按 KB 分表、单表规模小，先用正确性优先；表变大后可改为
+        ``WHERE :q <% text`` 并设置 ``pg_trgm.word_similarity_threshold``。
+
         Gracefully returns an empty list if the operator/extension is missing.
         """
         table_name = self._vector_index.table_name_from_str(str(kb_id))
@@ -315,9 +352,9 @@ class RAGEngine:
         try:
             sql = f"""
                 SELECT chunk_id, doc_id, text, metadata,
-                       similarity(text, :q) AS sim
+                       word_similarity(:q, text) AS sim
                 FROM {table_name}
-                WHERE similarity(text, :q) > :threshold
+                WHERE word_similarity(:q, text) > :threshold
                 ORDER BY sim DESC
                 LIMIT :limit
             """
@@ -335,6 +372,61 @@ class RAGEngine:
 
         return self._rows_to_chunks(result.fetchall(), channel="lexical")
 
+    # 中文停用字：这类字几乎出现在每个 chunk 里，用 OR 连接时会污染 ts_rank 排序，
+    # 所以从全文查询里剔除。只剔除"功能字"，不动"人/大/中"这类可能承载语义的字。
+    _FULLTEXT_STOPCHARS = frozenset(
+        "的了吗呢吧啊是在有就都也还很太又再只把被给对从向并且而且但是因为所以"
+        "我你他她它们这那么什么怎如何可以请帮下一些个之与及或者如果没不"
+    )
+
+    @classmethod
+    def _cjk_or_tsquery(cls, query: str) -> str:
+        """把中文查询转成 ``to_tsquery('simple', ...)`` 能吃的单字 OR 表达式。
+
+        PG 的 ``simple`` 配置不做中文分词，整句中文会被当成一个大 token，导致
+        ``tsvector @@ query`` 永远为 false（实测连"聊斋 剧本 大纲"都 0 命中）。
+        索引侧（``rag_cjk_tsv``）已改为**逐字切分**，查询侧必须同粒度：把每个汉字
+        拆出来，用 ``|``（OR）连接，让 ts_rank 按命中字数排序。
+
+        用 OR 而非 AND 是刻意的：混合检索的价值在"召回互补"，精选交给 RRF 与重排；
+        AND 会让"陈默推开木门"这类缺字的查询直接 0 命中。
+
+        返回空字符串表示没有可用检索词，调用方应跳过该通道。
+        """
+        terms: list[str] = []
+        buf: list[str] = []
+
+        def _flush_word() -> None:
+            """收尾一个拉丁词；单个孤立字母没有检索价值，丢弃。"""
+            if buf:
+                word = "".join(buf)
+                if len(word) > 1:
+                    terms.append(word)
+                buf.clear()
+
+        for ch in query:
+            # 汉字 / 假名逐字入列（扩展 A 区、统一表意、假名、兼容表意）
+            if (
+                "\u3400" <= ch <= "\u4dbf"
+                or "\u4e00" <= ch <= "\u9fff"
+                or "\u3040" <= ch <= "\u30ff"
+                or "\uf900" <= ch <= "\ufaff"
+            ):
+                _flush_word()
+                if ch not in cls._FULLTEXT_STOPCHARS:
+                    terms.append(ch)
+            elif ch.isascii() and (ch.isalnum() or ch == "_"):
+                buf.append(ch)
+            else:
+                # 标点/空白/全角符号：既不入检索词，也作为拉丁词的分隔符
+                _flush_word()
+        _flush_word()
+
+        # 去重（保持顺序），避免同一个字在 OR 表达式里重复出现
+        seen: set[str] = set()
+        unique = [t for t in terms if not (t in seen or seen.add(t))]
+        return " | ".join(unique)
+
     async def _retrieve_fulltext_chunks(
         self,
         db: AsyncSession,
@@ -343,24 +435,29 @@ class RAGEngine:
     ) -> list[RetrievedChunk]:
         """Retrieve chunks by PostgreSQL tsvector full-text ranking.
 
-        Uses 'simple' config (matches the generated column). Gracefully returns
-        an empty list if the tsvector channel is unavailable.
+        索引侧是逐字切分的 ``tsv``（见 ``index_manager.rag_cjk_tsv``），所以查询侧
+        也必须用逐字 OR 表达式，否则两边粒度不一致会永远匹配不上。
+        Gracefully returns an empty list if the tsvector channel is unavailable.
         """
         table_name = self._vector_index.table_name_from_str(str(kb_id))
+
+        tsquery = self._cjk_or_tsquery(query)
+        if not tsquery:
+            return []
 
         try:
             sql = f"""
                 SELECT chunk_id, doc_id, text, metadata,
-                       ts_rank(tsv, websearch_to_tsquery('simple', :q)) AS score
+                       ts_rank(tsv, to_tsquery('simple', :q)) AS score
                 FROM {table_name}
-                WHERE tsv @@ websearch_to_tsquery('simple', :q)
+                WHERE tsv @@ to_tsquery('simple', :q)
                 ORDER BY score DESC
                 LIMIT :limit
             """
             result = await db.execute(
                 sa_text(sql),
                 {
-                    "q": query,
+                    "q": tsquery,
                     "limit": settings.fulltext_top_k,
                 },
             )
@@ -385,6 +482,9 @@ class RAGEngine:
                     text=text,
                     metadata=meta,
                     score=float(score),
+                    # 单通道结果先原样带上；若随后进入 RRF 融合会被覆盖成融合原始分，
+                    # 若走纯向量路径则保留余弦相似度，语义一致且可解释。
+                    fused_score=float(score),
                     source=meta.get("filename", meta.get("source", "")),
                     channels=[channel],
                 )
@@ -427,12 +527,15 @@ class RAGEngine:
         if not combined:
             return []
 
-        # Order by fused score, then normalize to [0, 1] (max = 1.0)
+        # Order by fused score, then normalize to [0, 1] (max = 1.0).
+        # 归一化值只用于排序/展示：它会让 top1 恒等于 1.0，丢失"召回质量"信息，
+        # 因此原始 RRF 分同时保留在 ``fused_score`` 上供下游判别（见 RetrievedChunk）。
         ordered_ids = sorted(combined, key=lambda cid: combined[cid], reverse=True)[:top_n]
         max_score = combined[ordered_ids[0]] if ordered_ids else 1.0
         fused: list[RetrievedChunk] = []
         for cid in ordered_ids:
             chunk = copy.copy(payload[cid])
+            chunk.fused_score = combined[cid]
             chunk.score = combined[cid] / max_score if max_score else 0.0
             ranked = sorted(matched.get(cid, []))
             chunk.channels = ranked or chunk.channels
@@ -476,15 +579,19 @@ class RAGEngine:
         Runs the synchronous reranker in a thread to avoid blocking the event
         loop. If the reranker is not available (missing model / inference error)
         or disabled, falls back to ordering by the initial similarity score.
-        The reranked score is a [0,1] sigmoid relevance, so downstream
-        ``confidence_threshold`` gating keeps working as before.
+
+        注意分数口径：重排后 ``score`` 是 **[0,1] 的 sigmoid 绝对值**，与
+        ``_rrf_fuse`` 里 max 归一化后恒为 1.0 的 score 完全不是一回事，不可混用。
+        原始 logit 保留在 ``reranker_logit``；未归一化的 RRF 融合分保留在
+        ``fused_score``。拒答判据只用"召回是否为空"，不再依赖绝对分数
+        （详见 config.py 中 ``confidence_gate_enabled`` 的说明）。
         """
         from app.core.reranker import rerank
 
         candidates = [
             {"chunk_id": c.chunk_id, "doc_id": c.doc_id, "text": c.text,
              "metadata": c.metadata, "score": c.score, "source": c.source,
-             "channels": c.channels}
+             "channels": c.channels, "fused_score": c.fused_score}
             for c in chunks
         ]
 
@@ -495,18 +602,28 @@ class RAGEngine:
             rerank, question, candidates, settings.rerank_top_n
         )
 
-        return [
-            RetrievedChunk(
-                chunk_id=c["chunk_id"],
-                doc_id=c["doc_id"],
-                text=c["text"],
-                metadata=c.get("metadata", {}),
-                score=float(c["score"]),
-                source=c.get("source", ""),
-                channels=list(c.get("channels", [])),
+        results: list[RetrievedChunk] = []
+        for c in reranked:
+            # 原始 logit 必须留下来：sigmoid 之后的分数会掩盖"模型究竟觉得多相关"，
+            # 排查检索质量/调阈值时这个值比 sigmoid 有用得多。
+            logit = c.get("reranker_score")
+            meta = dict(c.get("metadata") or {})
+            if logit is not None:
+                meta["reranker_score"] = float(logit)
+            results.append(
+                RetrievedChunk(
+                    chunk_id=c["chunk_id"],
+                    doc_id=c["doc_id"],
+                    text=c["text"],
+                    metadata=meta,
+                    score=float(c["score"]),
+                    fused_score=float(c.get("fused_score", c.get("score", 0.0))),
+                    reranker_logit=float(logit) if logit is not None else None,
+                    source=c.get("source", ""),
+                    channels=list(c.get("channels", [])),
+                )
             )
-            for c in reranked
-        ]
+        return results
 
     def _build_context(self, chunks: list[RetrievedChunk]) -> str:
         """Build context string from retrieved chunks, truncated to token budget."""

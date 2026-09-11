@@ -17,7 +17,6 @@ import logging
 import math
 import threading
 from collections.abc import Sequence
-from functools import lru_cache
 from typing import Any
 
 import structlog
@@ -59,27 +58,39 @@ class _BGERerankerCore:
             self._device = "cuda"
             self._model = self._model.to("cuda")
 
+    # 推理批大小：全部候选一次性 tokenize 时，显存/内存峰值随候选数线性增长。
+    # 分批后峰值与批大小挂钩，与候选总数无关（rerank_top_n 调大时不会突然 OOM）。
+    _INFER_BATCH_SIZE = 8
+
     def score_pairs(self, pairs: Sequence[tuple[str, str]]) -> list[float]:
         """Score ``(query, passage)`` pairs. Returns raw logits (higher = more relevant)."""
         import torch
 
         self._ensure_loaded()
 
-        batched = [list(pair) for pair in pairs]
+        all_logits: list[float] = []
+        total = len(pairs)
+
         with torch.no_grad():
-            inputs = self._tokenizer(
-                batched,
-                padding=True,
-                truncation=True,
-                return_tensors="pt",
-                max_length=512,
-            )
-            if self._device == "cuda":
-                inputs = {k: v.to(self._device) for k, v in inputs.items()}
-            outputs = self._model(**inputs, return_dict=True)
-            # Cross-encoder logits: [batch, num_labels], squeeze to (batch,)
-            logits = outputs.logits.view(-1).float()
-            return logits.tolist()
+            for start in range(0, total, self._INFER_BATCH_SIZE):
+                batch = [
+                    list(pair)
+                    for pair in pairs[start : start + self._INFER_BATCH_SIZE]
+                ]
+                inputs = self._tokenizer(
+                    batch,
+                    padding=True,
+                    truncation=True,
+                    return_tensors="pt",
+                    max_length=512,
+                )
+                if self._device == "cuda":
+                    inputs = {k: v.to(self._device) for k, v in inputs.items()}
+                outputs = self._model(**inputs, return_dict=True)
+                # Cross-encoder logits: [batch, num_labels], squeeze to (batch,)
+                all_logits.extend(outputs.logits.view(-1).float().tolist())
+
+        return all_logits
 
 
 # --- Module-level singletons (thread-safe) ---
@@ -120,9 +131,14 @@ def _get_reranker() -> _BGERerankerCore | None:
             return None
 
 
-@lru_cache(maxsize=1)
 def reranker_enabled() -> bool:
-    """Whether heavyweight BGE reranking is requested by configuration."""
+    """Whether heavyweight BGE reranking is requested by configuration.
+
+    注意：这里**不能**加 ``@lru_cache``。历史版本曾加过，导致该函数的返回值在首次
+    调用后被永久缓存 —— 运行期改 ``settings.rerank_enabled`` 完全不生效（实测：
+    诊断脚本里把它改成 False 后，重排仍在跑，两次分数一模一样），排查时极易误判。
+    每次读取配置的开销可以忽略，正确性优先。
+    """
     return bool(settings.rerank_enabled)
 
 
